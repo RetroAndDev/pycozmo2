@@ -8,8 +8,8 @@ import select
 import socket
 import time
 from queue import Queue, Empty
-from threading import Thread, Lock
-from typing import Optional, Tuple, Any
+from threading import Thread, Lock, Event
+from typing import Callable, Optional, Tuple, Any
 
 from .logger import logger, logger_protocol
 from .frame import Frame
@@ -29,6 +29,7 @@ __all__ = [
 
     "ReceiveThread",
     "SendThread",
+    "PingThread",
     "Connection",
 ]
 
@@ -47,7 +48,8 @@ class SendThread(Thread):
 
     def __init__(self,
                  sock: socket.socket,
-                 receiver_address: Optional[Tuple[str, int]]) -> None:
+                 receiver_address: Optional[Tuple[str, int]],
+                 error_handler: Optional[Callable[[Exception], None]] = None) -> None:
         super().__init__(daemon=True, name=__class__.__name__)
         self.sock = sock
         self.lock = Lock()
@@ -59,6 +61,10 @@ class SendThread(Thread):
         self.last_ack = 0
         self.last_ack_time = 0
         self.disconnected = False
+        # Called from the thread when a fatal send error occurs.
+        self._error_handler = error_handler
+        # Last fatal exception, exposed for diagnostics.
+        self.error: Optional[Exception] = None
         # Number of packets received from the application layer.
         self.outgoing_packets = 0
         # Number of packets sent (includes resends).
@@ -80,8 +86,14 @@ class SendThread(Thread):
                 resend_pkts = self._resend_messages()
                 new_pkts, last_ack = self._collect_messages()
                 self._send_packets(resend_pkts + new_pkts, last_ack)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error("SendThread fatal error: %s", e, exc_info=True)
+                self.error = e
+                # Set the flag to exit the loop cleanly — never call self.stop()/join()
+                # from inside the thread itself as that would deadlock.
+                self.stop_flag = True
+                if self._error_handler:
+                    self._error_handler(e)
 
     def _collect_messages(self) -> Tuple[list, int]:
         with self.lock:
@@ -193,6 +205,7 @@ class SendThread(Thread):
             self.last_ack_time = 0
         if self.server:
             self.receiver_address = None
+        self.error = None
         self.outgoing_packets = 0
         self.sent_packets = 0
         self.sent_frames = 0
@@ -338,6 +351,32 @@ class ReceiveThread(Thread):
         self.delivered_packets = 0
 
 
+class PingThread(Thread):
+    """Dedicated thread that sends keepalive pings to the robot at a fixed interval.
+
+    Running independently of the event loop guarantees that pings are sent on time
+    even when event handlers are slow or blocking (e.g. time.sleep in _initialize_robot).
+    The robot disconnects after ~5 s without a ping; this thread fires every PING_INTERVAL
+    seconds regardless of what the rest of the application is doing.
+    """
+
+    def __init__(self, connection: "Connection") -> None:
+        super().__init__(daemon=True, name=__class__.__name__)
+        self._conn = connection
+        self._stop_event = Event()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self.join()
+
+    def run(self) -> None:
+        # _stop_event.wait() returns True when stop() is called, False on timeout.
+        while not self._stop_event.wait(timeout=self._conn.PING_INTERVAL):
+            if self._conn.state == Connection.CONNECTED:
+                self._conn._send_ping()
+                logger_protocol.debug("Ping #%d sent.", self._conn.ping_counter - 1)
+
+
 class Connection(Thread, event.Dispatcher):
     """ Cozmo protocol low-level connection implementing bot client and server sides. """
 
@@ -372,14 +411,19 @@ class Connection(Thread, event.Dispatcher):
         if server:
             self.sock.bind(self.robot_addr)
         self.sock.setblocking(False)
-        self.send_thread = SendThread(self.sock, None if server else self.robot_addr)
+        self.send_thread = SendThread(
+            self.sock,
+            None if server else self.robot_addr,
+            error_handler=self._on_send_thread_error,
+        )
         self.recv_thread = ReceiveThread(
             self.sock, self.send_thread, None if server else self.robot_addr, self._on_packet)
         self.stop_flag = False
         self.send_last = 0
-        self.ping_last = 0
         self.stats_last = 0
         self.ping_counter = 0
+        # PingThread is only used on the client side (not server).
+        self.ping_thread: Optional[PingThread] = None if server else PingThread(self)
 
     def start(self) -> None:
         logger.debug("Starting...")
@@ -389,11 +433,15 @@ class Connection(Thread, event.Dispatcher):
         self.add_handler(protocol_encoder.Ping, self._on_ping)
         self.recv_thread.start()
         self.send_thread.start()
+        if self.ping_thread:
+            self.ping_thread.start()
         super().start()
 
     def stop(self) -> None:
         logger.debug("Stopping...")
         self.stop_flag = True
+        if self.ping_thread:
+            self.ping_thread.stop()
         self.join()
         self.send_thread.stop()
         self.recv_thread.stop()
@@ -415,9 +463,6 @@ class Connection(Thread, event.Dispatcher):
 
             if not self.server and self.state == self.CONNECTED:
                 now = time.perf_counter()
-                if now - self.ping_last > self.PING_INTERVAL:
-                    self._send_ping()
-                    self.ping_last = now
                 if now - self.stats_last > self.STATS_INTERVAL:
                     self.log_stats()
                     self.stats_last = now
@@ -483,6 +528,16 @@ class Connection(Thread, event.Dispatcher):
         del cli, pkt
         self.state = self.IDLE
         logger_protocol.debug("Disconnected.")
+
+    def _on_send_thread_error(self, exc: Exception) -> None:
+        """Called by SendThread (from its own thread) when a fatal error occurs.
+
+        Must be thread-safe: only posts to the Queue, never touches shared state directly.
+        Injecting a synthetic Disconnect into the event queue lets the existing
+        _on_disconnect handler (and future reconnection logic) react normally.
+        """
+        logger.error("SendThread crashed — injecting Disconnect event. Cause: %s", exc)
+        self.queue.put((event.EvtPacketReceived, [protocol_encoder.Disconnect()], {}))
 
     def _on_ping(self, cli, pkt: protocol_encoder.Ping):
         if self.server:

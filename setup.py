@@ -5,10 +5,8 @@ PyCozmo setup script.
 """
 
 import os
-import sys
 import re
 import setuptools
-from distutils.version import LooseVersion
 
 
 def get_package_variable(key):
@@ -27,10 +25,6 @@ def get_readme():
     return readme
 
 
-# Check for setuptools version as long_description_content_type is not supported in older versions.
-if LooseVersion(setuptools.__version__) < LooseVersion("38.6.0"):
-    sys.exit("ERROR: setuptools 38.6.0 or newer required.")
-
 setuptools.setup(
     name="pycozmo",
     packages=setuptools.find_packages(),
@@ -42,17 +36,15 @@ setuptools.setup(
     author="Kaloyan Tenchov",
     author_email="zayfod@gmail.com",
     url="https://github.com/zayfod/pycozmo/",
-    python_requires=">=3.6.0",
+    python_requires=">=3.14",
     install_requires=["dpkt", "numpy", "Pillow>=6.0.0", "flatbuffers"],
     keywords=["ddl", "anki", "cozmo", "robot", "robotics"],
     classifiers=[
         "Development Status :: 4 - Beta",
         "License :: OSI Approved :: MIT License",
         "Programming Language :: Python",
-        "Programming Language :: Python :: 3.6",
-        "Programming Language :: Python :: 3.7",
-        "Programming Language :: Python :: 3.8",
-        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.14",
         "Topic :: Software Development :: Libraries",
         "Topic :: Software Development :: Libraries :: Python Modules",
         "Intended Audience :: Developers",
